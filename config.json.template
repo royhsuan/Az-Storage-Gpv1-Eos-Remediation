@@ -1,0 +1,12 @@
+{
+  "subscriptions": [
+    {
+      "id": "YOUR_SUBSCRIPTION_ID_1",
+      "name": "YOUR_SUBSCRIPTION_NAME_1"
+    },
+    {
+      "id": "YOUR_SUBSCRIPTION_ID_2",
+      "name": "YOUR_SUBSCRIPTION_NAME_2"
+    }
+  ]
+}

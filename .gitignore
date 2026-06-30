@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+config.json
+storage_inventory.csv
+storage_inventory.md
+.env

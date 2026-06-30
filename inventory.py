@@ -1,0 +1,293 @@
+import os
+import sys
+import json
+import csv
+from datetime import datetime, timedelta
+from azure.identity import DefaultAzureCredential, DeviceCodeCredential
+from azure.mgmt.storage import StorageManagementClient
+from azure.monitor.querymetrics import MetricsClient, MetricAggregationType
+
+# Force UTF-8 encoding for stdout and stderr to prevent garbled text (亂碼) on Windows console redirect
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
+# Configuration files
+CONFIG_FILE = "config.json"
+CSV_FILE = "storage_inventory.csv"
+MD_FILE = "storage_inventory.md"
+
+def load_config():
+    """Load subscriptions from config.json."""
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Error: {CONFIG_FILE} not found. Please create it using config.json.template.")
+        exit(1)
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def get_credential():
+    """Retrieve Azure credentials using DefaultAzureCredential with a DeviceCode fallback."""
+    print("Authenticating with Azure...", flush=True)
+    try:
+        # First, try DefaultAzureCredential
+        credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
+        # Test if credential can fetch a token (fails fast if not authenticated)
+        credential.get_token("https://management.azure.com/.default")
+        print("Successfully authenticated using DefaultAzureCredential.", flush=True)
+        return credential
+    except Exception as e:
+        print(f"\nDefaultAzureCredential failed to authenticate: {e}", flush=True)
+        print("Attempting Device Code login fallback...", flush=True)
+        try:
+            # DeviceCodeCredential prompts on stdout/stderr, which will show up in our logs
+            credential = DeviceCodeCredential()
+            # Test if credential can fetch a token (triggers the console prompt)
+            credential.get_token("https://management.azure.com/.default")
+            print("Successfully authenticated via Device Code.", flush=True)
+            return credential
+        except Exception as auth_err:
+            print(f"Device Code authentication failed: {auth_err}", flush=True)
+            print("\nPlease make sure you are logged in using Azure CLI ('az login') or Azure PowerShell ('Connect-AzAccount').", flush=True)
+            exit(1)
+
+def query_metrics(metrics_client, resource_id):
+    """Query capacity, transactions, ingress, and egress metrics for the last 30 days."""
+    capacity_gb = 0.0
+    transactions = 0
+    ingress_gb = 0.0
+    egress_gb = 0.0
+    
+    try:
+        # Query metrics for the last 30 days
+        timespan = timedelta(days=30)
+        granularity = timedelta(hours=1) # Hourly data points (PT1H) - commonly supported grain
+        
+        response = metrics_client.query_resources(
+            resource_ids=[resource_id],
+            metric_namespace="Microsoft.Storage/storageAccounts",
+            metric_names=["UsedCapacity", "Transactions", "Ingress", "Egress"],
+            timespan=timespan,
+            granularity=granularity,
+            aggregations=[MetricAggregationType.AVERAGE, MetricAggregationType.TOTAL]
+        )
+        
+        # Track capacity gauge (most recent non-None value)
+        latest_capacity_bytes = None
+        
+        # Track traffic totals (sum of all daily values)
+        total_tx = 0
+        total_ingress_bytes = 0
+        total_egress_bytes = 0
+        
+        for metrics_query_result in response:
+            for metric in metrics_query_result.metrics:
+                if metric.name == "UsedCapacity":
+                    for timeseries in metric.timeseries:
+                        for data in timeseries.data:
+                            if data.average is not None:
+                                latest_capacity_bytes = data.average
+                elif metric.name == "Transactions":
+                    for timeseries in metric.timeseries:
+                        for data in timeseries.data:
+                            if data.total is not None:
+                                total_tx += int(data.total)
+                elif metric.name == "Ingress":
+                    for timeseries in metric.timeseries:
+                        for data in timeseries.data:
+                            if data.total is not None:
+                                total_ingress_bytes += data.total
+                elif metric.name == "Egress":
+                    for timeseries in metric.timeseries:
+                        for data in timeseries.data:
+                            if data.total is not None:
+                                total_egress_bytes += data.total
+                                
+        if latest_capacity_bytes is not None:
+            capacity_gb = round(latest_capacity_bytes / (1024 ** 3), 3)
+        transactions = total_tx
+        ingress_gb = round(total_ingress_bytes / (1024 ** 3), 3)
+        egress_gb = round(total_egress_bytes / (1024 ** 3), 3)
+                            
+        return capacity_gb, transactions, ingress_gb, egress_gb
+    except Exception as e:
+        # Gracefully handle cases where the user lacks Monitoring Reader permissions
+        # or when metrics are not available for the resource.
+        print(f"  [Warning] Error querying metrics for {resource_id.split('/')[-1]}: {e}", flush=True)
+        return "N/A", "N/A", "N/A", "N/A"
+
+def check_databricks_managed(account_name, resource_group, tags):
+    """Detect if the storage account is managed by Databricks."""
+    rg_lower = resource_group.lower()
+    if rg_lower.startswith("db-") or "databricks" in rg_lower:
+        return True
+    
+    if tags:
+        for k, v in tags.items():
+            if "databricks" in k.lower() or (v and "databricks" in v.lower()):
+                return True
+    return False
+
+def scan_storage_accounts():
+    config = load_config()
+    credential = get_credential()
+    
+    inventory = []
+    metrics_clients = {} # Cache regional MetricsClient instances
+    
+    print("\nStarting Azure Storage Inventory Scan...")
+    
+    for sub in config.get("subscriptions", []):
+        sub_id = sub.get("id")
+        sub_name = sub.get("name")
+        print(f"\nScanning Subscription: {sub_name} ({sub_id})...")
+        
+        try:
+            storage_client = StorageManagementClient(credential, sub_id)
+            accounts = list(storage_client.storage_accounts.list())
+            print(f"Found {len(accounts)} storage accounts in subscription '{sub_name}'.")
+            
+            for index, account in enumerate(accounts, 1):
+                name = account.name
+                # Parse resource group from id
+                resource_group = account.id.split("/")[4]
+                kind = account.kind # e.g. Storage, StorageV2, BlobStorage
+                sku = account.sku.name # e.g. Standard_LRS, Premium_LRS
+                location = account.location
+                access_tier = getattr(account, "access_tier", "N/A")
+                is_hns_enabled = getattr(account, "is_hns_enabled", False)
+                public_network = getattr(account, "public_network_access", "N/A")
+                tags = getattr(account, "tags", {})
+                
+                print(f"  [{index}/{len(accounts)}] Processing {name} ({kind})...")
+                
+                # Check if it is managed by Databricks
+                is_db_managed = check_databricks_managed(name, resource_group, tags)
+                
+                # Determine migration action
+                kind_lower = kind.lower()
+                if is_db_managed:
+                    migration_needed = "No (Databricks Managed)"
+                    migration_action = "Microsoft will automatically migrate Databricks workspaces. No action needed."
+                elif kind_lower in ["storage", "blobstorage"]:
+                    migration_needed = "Yes"
+                    migration_action = "Upgrade to StorageV2 (GPv2) required before 13 Oct 2026."
+                else:
+                    migration_needed = "No"
+                    migration_action = "Already on GPv2 or Premium. No upgrade required."
+                
+                # Fetch usage metrics
+                # Normalize location for Metrics regional endpoint
+                normalized_loc = location.lower().replace(" ", "")
+                if normalized_loc not in metrics_clients:
+                    endpoint = f"https://{normalized_loc}.metrics.monitor.azure.com"
+                    metrics_clients[normalized_loc] = MetricsClient(endpoint, credential)
+                
+                client = metrics_clients[normalized_loc]
+                capacity_gb, transactions, ingress_gb, egress_gb = query_metrics(client, account.id)
+                
+                inventory.append({
+                    "subscription_name": sub_name,
+                    "subscription_id": sub_id,
+                    "resource_group": resource_group,
+                    "account_name": name,
+                    "location": location,
+                    "kind": kind,
+                    "sku": sku,
+                    "access_tier": access_tier if access_tier else "N/A",
+                    "hns_enabled": "Yes" if is_hns_enabled else "No",
+                    "public_network": public_network if public_network else "N/A",
+                    "migration_needed": migration_needed,
+                    "migration_action": migration_action,
+                    "capacity_gb": capacity_gb,
+                    "transactions": transactions,
+                    "ingress_gb": ingress_gb,
+                    "egress_gb": egress_gb
+                })
+        except Exception as e:
+            print(f"Error scanning subscription '{sub_name}': {e}")
+            
+    return inventory
+
+def write_outputs(inventory):
+    # Sort inventory: Migration Needed first, then by subscription and name
+    inventory.sort(key=lambda x: (x["migration_needed"] != "Yes", x["subscription_name"], x["account_name"]))
+    
+    # 1. Write CSV File
+    fieldnames = [
+        "subscription_name", "subscription_id", "resource_group", "account_name", 
+        "location", "kind", "sku", "access_tier", "hns_enabled", "public_network", 
+        "migration_needed", "migration_action", "capacity_gb", "transactions", 
+        "ingress_gb", "egress_gb"
+    ]
+    
+    # Write using utf-8-sig (with BOM) so that Microsoft Excel can read Chinese characters properly
+    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(inventory)
+        
+    print(f"\nCSV Inventory report saved to {CSV_FILE}")
+    
+    # 2. Write Markdown File
+    with open(MD_FILE, "w", encoding="utf-8") as f:
+        f.write("# Azure Storage GPv1 Migration Inventory & Analysis Report\n\n")
+        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        # Summary statistics
+        total_accounts = len(inventory)
+        migration_required_count = sum(1 for x in inventory if x["migration_needed"] == "Yes")
+        db_managed_count = sum(1 for x in inventory if "Databricks" in x["migration_needed"])
+        already_v2_count = total_accounts - migration_required_count - db_managed_count
+        
+        f.write("## Executive Summary\n\n")
+        f.write(f"- **Total Storage Accounts Scanned:** {total_accounts}\n")
+        f.write(f"- **Manual Upgrade Required (GPv1/BlobStorage):** {migration_required_count}\n")
+        f.write(f"- **Microsoft-Managed Upgrade (Databricks GPv1):** {db_managed_count}\n")
+        f.write(f"- **Already Upgraded / Compliant (GPv2/Premium):** {already_v2_count}\n\n")
+        
+        # Section 1: Action Required
+        f.write("## ⚠️ Storage Accounts Requiring Manual Upgrade\n\n")
+        f.write("The following accounts must be upgraded to **GPv2 (StorageV2)** before **13 October 2026** to avoid automatic migration or potential service disruptions.\n\n")
+        
+        manual_migration_list = [x for x in inventory if x["migration_needed"] == "Yes"]
+        if manual_migration_list:
+            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended Action |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            for x in manual_migration_list:
+                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | Plan to migrate to GPv2. Set tier based on usage. |\n")
+        else:
+            f.write("No storage accounts require manual upgrade! All accounts are compliant.\n")
+        f.write("\n")
+        
+        # Section 2: Databricks Managed
+        f.write("## ℹ️ Databricks Managed Storage Accounts\n\n")
+        f.write("These accounts are associated with Databricks workspaces and will be managed and upgraded automatically by Microsoft. No manual action is required.\n\n")
+        
+        db_migration_list = [x for x in inventory if "Databricks" in x["migration_needed"]]
+        if db_migration_list:
+            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- |\n")
+            for x in db_migration_list:
+                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} |\n")
+        else:
+            f.write("No Databricks managed storage accounts found.\n")
+        f.write("\n")
+        
+        # Section 3: All Details
+        f.write("## Detailed Inventory Table\n\n")
+        f.write("| Subscription | Resource Group | Storage Account | Location | Kind | SKU | Tier | HNS | Public Net | Migration? | Size (GB) | 30d Txn | Ingress (GB) | Egress (GB) |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for x in inventory:
+            hns = "Yes" if x["hns_enabled"] == "Yes" else "No"
+            f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['location']} | {x['kind']} | {x['sku']} | {x['access_tier']} | {hns} | {x['public_network']} | {x['migration_needed']} | {x['capacity_gb']} | {x['transactions']} | {x['ingress_gb']} | {x['egress_gb']} |\n")
+            
+    print(f"Markdown Inventory report saved to {MD_FILE}")
+
+if __name__ == "__main__":
+    inventory_data = scan_storage_accounts()
+    if inventory_data:
+        write_outputs(inventory_data)
+        print("\nScan completed successfully!")
+    else:
+        print("\nScan yielded no storage account data. Check credentials or configuration.")
