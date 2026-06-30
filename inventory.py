@@ -17,6 +17,7 @@ if hasattr(sys.stderr, 'reconfigure'):
 CONFIG_FILE = "config.json"
 CSV_FILE = "storage_inventory.csv"
 MD_FILE = "storage_inventory.md"
+VERSION = "1.1.0"
 
 def load_config():
     """Load subscriptions from config.json."""
@@ -228,7 +229,8 @@ def scan_storage_accounts():
                     "capacity_gb": capacity_gb,
                     "transactions": transactions,
                     "ingress_gb": ingress_gb,
-                    "egress_gb": egress_gb
+                    "egress_gb": egress_gb,
+                    "report_version": VERSION
                 })
         except Exception as e:
             print(f"Error scanning subscription '{sub_name}': {e}")
@@ -244,71 +246,92 @@ def write_outputs(inventory):
         "subscription_name", "subscription_id", "resource_group", "account_name", 
         "location", "kind", "sku", "access_tier", "hns_enabled", "public_network", 
         "migration_needed", "migration_action", "capacity_gb", "transactions", 
-        "ingress_gb", "egress_gb"
+        "ingress_gb", "egress_gb", "report_version"
     ]
     
     # Write using utf-8-sig (with BOM) so that Microsoft Excel can read Chinese characters properly
-    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(inventory)
+    try:
+        with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(inventory)
+        print(f"\nCSV Inventory report saved to {CSV_FILE}")
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback_csv = f"storage_inventory_{timestamp}.csv"
+        print(f"\n[Warning] Permission denied writing to {CSV_FILE} (it may be open in Excel).")
+        print(f"Saving CSV report to fallback file: {fallback_csv}")
+        with open(fallback_csv, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(inventory)
         
-    print(f"\nCSV Inventory report saved to {CSV_FILE}")
-    
     # 2. Write Markdown File
-    with open(MD_FILE, "w", encoding="utf-8") as f:
-        f.write("# Azure Storage GPv1 Migration Inventory & Analysis Report\n\n")
-        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        # Summary statistics
-        total_accounts = len(inventory)
-        migration_required_count = sum(1 for x in inventory if x["migration_needed"] == "Yes")
-        system_managed_count = sum(1 for x in inventory if x["migration_needed"] not in ["Yes", "No"])
-        already_v2_count = total_accounts - migration_required_count - system_managed_count
-        
-        f.write("## Executive Summary\n\n")
-        f.write(f"- **Total Storage Accounts Scanned:** {total_accounts}\n")
-        f.write(f"- **Manual Upgrade Required (GPv1/BlobStorage):** {migration_required_count}\n")
-        f.write(f"- **System-Managed / Excluded Accounts (Databricks, AKS, etc.):** {system_managed_count}\n")
-        f.write(f"- **Already Upgraded / Compliant (GPv2/Premium):** {already_v2_count}\n\n")
-        
-        # Section 1: Action Required
-        f.write("## ⚠️ Storage Accounts Requiring Manual Upgrade\n\n")
-        f.write("The following accounts must be upgraded to **GPv2 (StorageV2)** before **13 October 2026** to avoid automatic migration or potential service disruptions.\n\n")
-        
-        manual_migration_list = [x for x in inventory if x["migration_needed"] == "Yes"]
-        if manual_migration_list:
-            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended Action |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
-            for x in manual_migration_list:
-                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | Plan to migrate to GPv2. Set tier based on usage. |\n")
-        else:
-            f.write("No storage accounts require manual upgrade! All accounts are compliant.\n")
-        f.write("\n")
-        
-        # Section 2: System Managed / Excluded
-        f.write("## ℹ️ System Managed Storage Accounts (Databricks, AKS, etc.)\n\n")
-        f.write("These accounts are associated with managed services (e.g. Databricks workspaces, AKS node pools) and will be managed and upgraded automatically by Microsoft or the service. No manual action is required.\n\n")
-        
-        system_migration_list = [x for x in inventory if x["migration_needed"] not in ["Yes", "No"]]
-        if system_migration_list:
-            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Managed By |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
-            for x in system_migration_list:
-                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['migration_needed']} |\n")
-        else:
-            f.write("No system-managed storage accounts found.\n")
-        f.write("\n")
-        
-        # Section 3: All Details
-        f.write("## Detailed Inventory Table\n\n")
-        f.write("| Subscription | Resource Group | Storage Account | Location | Kind | SKU | Tier | HNS | Public Net | Migration? | Size (GB) | 30d Txn | Ingress (GB) | Egress (GB) |\n")
-        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
-        for x in inventory:
-            hns = "Yes" if x["hns_enabled"] == "Yes" else "No"
-            f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['location']} | {x['kind']} | {x['sku']} | {x['access_tier']} | {hns} | {x['public_network']} | {x['migration_needed']} | {x['capacity_gb']} | {x['transactions']} | {x['ingress_gb']} | {x['egress_gb']} |\n")
-            
-    print(f"Markdown Inventory report saved to {MD_FILE}")
+    md_content = []
+    md_content.append("# Azure Storage GPv1 Migration Inventory & Analysis Report\n\n")
+    md_content.append(f"Report Version: {VERSION}\n")
+    md_content.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    # Summary statistics
+    total_accounts = len(inventory)
+    migration_required_count = sum(1 for x in inventory if x["migration_needed"] == "Yes")
+    system_managed_count = sum(1 for x in inventory if x["migration_needed"] not in ["Yes", "No"])
+    already_v2_count = total_accounts - migration_required_count - system_managed_count
+    
+    md_content.append("## Executive Summary\n\n")
+    md_content.append(f"- **Total Storage Accounts Scanned:** {total_accounts}\n")
+    md_content.append(f"- **Manual Upgrade Required (GPv1/BlobStorage):** {migration_required_count}\n")
+    md_content.append(f"- **System-Managed / Excluded Accounts (Databricks, AKS, etc.):** {system_managed_count}\n")
+    md_content.append(f"- **Already Upgraded / Compliant (GPv2/Premium):** {already_v2_count}\n\n")
+    
+    # Section 1: Action Required
+    md_content.append("## ⚠️ Storage Accounts Requiring Manual Upgrade\n\n")
+    md_content.append("The following accounts must be upgraded to **GPv2 (StorageV2)** before **13 October 2026** to avoid automatic migration or potential service disruptions.\n\n")
+    
+    manual_migration_list = [x for x in inventory if x["migration_needed"] == "Yes"]
+    if manual_migration_list:
+        md_content.append("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended Action |\n")
+        md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for x in manual_migration_list:
+            md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | Plan to migrate to GPv2. Set tier based on usage. |\n")
+    else:
+        md_content.append("No storage accounts require manual upgrade! All accounts are compliant.\n")
+    md_content.append("\n")
+    
+    # Section 2: System Managed / Excluded
+    md_content.append("## ℹ️ System Managed Storage Accounts (Databricks, AKS, etc.)\n\n")
+    md_content.append("These accounts are associated with managed services (e.g. Databricks workspaces, AKS node pools) and will be managed and upgraded automatically by Microsoft or the service. No manual action is required.\n\n")
+    
+    system_migration_list = [x for x in inventory if x["migration_needed"] not in ["Yes", "No"]]
+    if system_migration_list:
+        md_content.append("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Managed By |\n")
+        md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for x in system_migration_list:
+            md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['migration_needed']} |\n")
+    else:
+        md_content.append("No system-managed storage accounts found.\n")
+    md_content.append("\n")
+    
+    # Section 3: All Details
+    md_content.append("## Detailed Inventory Table\n\n")
+    md_content.append("| Subscription | Resource Group | Storage Account | Location | Kind | SKU | Tier | HNS | Public Net | Migration? | Size (GB) | 30d Txn | Ingress (GB) | Egress (GB) |\n")
+    md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+    for x in inventory:
+        hns = "Yes" if x["hns_enabled"] == "Yes" else "No"
+        md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['location']} | {x['kind']} | {x['sku']} | {x['access_tier']} | {hns} | {x['public_network']} | {x['migration_needed']} | {x['capacity_gb']} | {x['transactions']} | {x['ingress_gb']} | {x['egress_gb']} |\n")
+
+    full_md_text = "".join(md_content)
+    try:
+        with open(MD_FILE, "w", encoding="utf-8") as f:
+            f.write(full_md_text)
+        print(f"Markdown Inventory report saved to {MD_FILE}")
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback_md = f"storage_inventory_{timestamp}.md"
+        print(f"[Warning] Permission denied writing to {MD_FILE} (it may be open in another editor).")
+        print(f"Saving Markdown report to fallback file: {fallback_md}")
+        with open(fallback_md, "w", encoding="utf-8") as f:
+            f.write(full_md_text)
 
 if __name__ == "__main__":
     inventory_data = scan_storage_accounts()
