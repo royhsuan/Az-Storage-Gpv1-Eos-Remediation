@@ -116,17 +116,43 @@ def query_metrics(metrics_client, resource_id):
         print(f"  [Warning] Error querying metrics for {resource_id.split('/')[-1]}: {e}", flush=True)
         return "N/A", "N/A", "N/A", "N/A"
 
-def check_databricks_managed(account_name, resource_group, tags):
-    """Detect if the storage account is managed by Databricks."""
+def check_system_managed(account_name, resource_group, tags):
+    """Detect if the storage account is managed by Azure services (Databricks, AKS, Spring Apps, HDInsight, Synapse)."""
     rg_lower = resource_group.lower()
-    if rg_lower.startswith("db-") or "databricks" in rg_lower:
-        return True
     
+    # 1. Databricks Managed
+    if rg_lower.startswith("db-") or "databricks" in rg_lower:
+        return True, "Databricks"
     if tags:
         for k, v in tags.items():
             if "databricks" in k.lower() or (v and "databricks" in v.lower()):
-                return True
-    return False
+                return True, "Databricks"
+                
+    # 2. Azure Kubernetes Service (AKS) Managed
+    if rg_lower.startswith("mc_"):
+        return True, "AKS"
+    if tags:
+        for k, v in tags.items():
+            if "aks" in k.lower() or "kubernetes" in k.lower() or (v and ("aks" in v.lower() or "kubernetes" in v.lower())):
+                return True, "AKS"
+                
+    # 3. Azure Spring Apps Managed
+    if rg_lower.startswith("ap-svc-rt-") or "spring-cloud" in rg_lower or "springapps" in rg_lower:
+        return True, "Azure Spring Apps"
+        
+    # 4. HDInsight Managed
+    if "hdinsight" in rg_lower:
+        return True, "HDInsight"
+    if tags:
+        for k, v in tags.items():
+            if "hdinsight" in k.lower() or (v and "hdinsight" in v.lower()):
+                return True, "HDInsight"
+                
+    # 5. Synapse Workspace Managed
+    if rg_lower.startswith("synapse-") or "workspace-managed-rg" in rg_lower:
+        return True, "Synapse"
+        
+    return False, None
 
 def scan_storage_accounts():
     config = load_config()
@@ -161,14 +187,14 @@ def scan_storage_accounts():
                 
                 print(f"  [{index}/{len(accounts)}] Processing {name} ({kind})...")
                 
-                # Check if it is managed by Databricks
-                is_db_managed = check_databricks_managed(name, resource_group, tags)
+                # Check if it is managed by a system service
+                is_sys_managed, service_name = check_system_managed(name, resource_group, tags)
                 
                 # Determine migration action
                 kind_lower = kind.lower()
-                if is_db_managed:
-                    migration_needed = "No (Databricks Managed)"
-                    migration_action = "Microsoft will automatically migrate Databricks workspaces. No action needed."
+                if is_sys_managed:
+                    migration_needed = f"No ({service_name} Managed)"
+                    migration_action = f"Managed by {service_name}. Will be managed/migrated automatically by the service. No manual action needed."
                 elif kind_lower in ["storage", "blobstorage"]:
                     migration_needed = "Yes"
                     migration_action = "Upgrade to StorageV2 (GPv2) required before 13 Oct 2026."
@@ -237,13 +263,13 @@ def write_outputs(inventory):
         # Summary statistics
         total_accounts = len(inventory)
         migration_required_count = sum(1 for x in inventory if x["migration_needed"] == "Yes")
-        db_managed_count = sum(1 for x in inventory if "Databricks" in x["migration_needed"])
-        already_v2_count = total_accounts - migration_required_count - db_managed_count
+        system_managed_count = sum(1 for x in inventory if x["migration_needed"] not in ["Yes", "No"])
+        already_v2_count = total_accounts - migration_required_count - system_managed_count
         
         f.write("## Executive Summary\n\n")
         f.write(f"- **Total Storage Accounts Scanned:** {total_accounts}\n")
         f.write(f"- **Manual Upgrade Required (GPv1/BlobStorage):** {migration_required_count}\n")
-        f.write(f"- **Microsoft-Managed Upgrade (Databricks GPv1):** {db_managed_count}\n")
+        f.write(f"- **System-Managed / Excluded Accounts (Databricks, AKS, etc.):** {system_managed_count}\n")
         f.write(f"- **Already Upgraded / Compliant (GPv2/Premium):** {already_v2_count}\n\n")
         
         # Section 1: Action Required
@@ -260,18 +286,18 @@ def write_outputs(inventory):
             f.write("No storage accounts require manual upgrade! All accounts are compliant.\n")
         f.write("\n")
         
-        # Section 2: Databricks Managed
-        f.write("## ℹ️ Databricks Managed Storage Accounts\n\n")
-        f.write("These accounts are associated with Databricks workspaces and will be managed and upgraded automatically by Microsoft. No manual action is required.\n\n")
+        # Section 2: System Managed / Excluded
+        f.write("## ℹ️ System Managed Storage Accounts (Databricks, AKS, etc.)\n\n")
+        f.write("These accounts are associated with managed services (e.g. Databricks workspaces, AKS node pools) and will be managed and upgraded automatically by Microsoft or the service. No manual action is required.\n\n")
         
-        db_migration_list = [x for x in inventory if "Databricks" in x["migration_needed"]]
-        if db_migration_list:
-            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions |\n")
-            f.write("| --- | --- | --- | --- | --- | --- | --- |\n")
-            for x in db_migration_list:
-                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} |\n")
+        system_migration_list = [x for x in inventory if x["migration_needed"] not in ["Yes", "No"]]
+        if system_migration_list:
+            f.write("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Managed By |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            for x in system_migration_list:
+                f.write(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['migration_needed']} |\n")
         else:
-            f.write("No Databricks managed storage accounts found.\n")
+            f.write("No system-managed storage accounts found.\n")
         f.write("\n")
         
         # Section 3: All Details
