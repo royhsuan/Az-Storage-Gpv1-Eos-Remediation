@@ -155,6 +155,32 @@ def check_system_managed(account_name, resource_group, tags):
         
     return False, None
 
+def recommend_tier(capacity_gb, transactions, ingress_gb, egress_gb):
+    """Recommend the GPv2 default access tier (Hot, Cool, or Cold) based on 30d usage."""
+    if transactions == "N/A":
+        return "Hot (Default)"
+        
+    try:
+        tx = int(transactions)
+        cap = float(capacity_gb) if capacity_gb != "N/A" else 0.0
+        in_gb = float(ingress_gb) if ingress_gb != "N/A" else 0.0
+        out_gb = float(egress_gb) if egress_gb != "N/A" else 0.0
+    except ValueError:
+        return "Hot (Default)"
+        
+    # Rule 1: High Transaction Volume (> 10,000 txns in 30 days) -> Hot
+    # (Since transaction unit cost in Cool/Cold is high, active workloads must be Hot)
+    if tx > 10000:
+        return "Hot"
+        
+    # Rule 2: Completely idle (<= 10 transactions and 0 traffic) -> Cold
+    # (Cold tier has very cheap storage but highest transaction cost; perfect for archiving)
+    if tx <= 10 and in_gb == 0.0 and out_gb == 0.0:
+        return "Cold"
+        
+    # Rule 3: Low transaction but not completely idle -> Cool
+    return "Cool"
+
 def scan_storage_accounts():
     config = load_config()
     credential = get_credential()
@@ -213,6 +239,9 @@ def scan_storage_accounts():
                 client = metrics_clients[normalized_loc]
                 capacity_gb, transactions, ingress_gb, egress_gb = query_metrics(client, account.id)
                 
+                # Identify recommended tier (Hot, Cool, Cold)
+                rec_tier = recommend_tier(capacity_gb, transactions, ingress_gb, egress_gb)
+                
                 inventory.append({
                     "subscription_name": sub_name,
                     "subscription_id": sub_id,
@@ -230,6 +259,7 @@ def scan_storage_accounts():
                     "transactions": transactions,
                     "ingress_gb": ingress_gb,
                     "egress_gb": egress_gb,
+                    "recommended_tier": rec_tier,
                     "report_version": VERSION
                 })
         except Exception as e:
@@ -241,30 +271,28 @@ def write_outputs(inventory):
     # Sort inventory: Migration Needed first, then by subscription and name
     inventory.sort(key=lambda x: (x["migration_needed"] != "Yes", x["subscription_name"], x["account_name"]))
     
+    # Define timestamped output filenames
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_file = f"storage_inventory_{timestamp}.csv"
+    md_file = f"storage_inventory_{timestamp}.md"
+    
     # 1. Write CSV File
     fieldnames = [
         "subscription_name", "subscription_id", "resource_group", "account_name", 
         "location", "kind", "sku", "access_tier", "hns_enabled", "public_network", 
         "migration_needed", "migration_action", "capacity_gb", "transactions", 
-        "ingress_gb", "egress_gb", "report_version"
+        "ingress_gb", "egress_gb", "recommended_tier", "report_version"
     ]
     
     # Write using utf-8-sig (with BOM) so that Microsoft Excel can read Chinese characters properly
     try:
-        with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(inventory)
-        print(f"\nCSV Inventory report saved to {CSV_FILE}")
-    except PermissionError:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fallback_csv = f"storage_inventory_{timestamp}.csv"
-        print(f"\n[Warning] Permission denied writing to {CSV_FILE} (it may be open in Excel).")
-        print(f"Saving CSV report to fallback file: {fallback_csv}")
-        with open(fallback_csv, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(inventory)
+        print(f"\nCSV Inventory report saved to {csv_file}")
+    except PermissionError as e:
+        print(f"\n[Error] Permission denied writing to {csv_file}: {e}")
         
     # 2. Write Markdown File
     md_content = []
@@ -290,10 +318,10 @@ def write_outputs(inventory):
     
     manual_migration_list = [x for x in inventory if x["migration_needed"] == "Yes"]
     if manual_migration_list:
-        md_content.append("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended Action |\n")
-        md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        md_content.append("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended GPv2 Tier | Recommended Action |\n")
+        md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for x in manual_migration_list:
-            md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | Plan to migrate to GPv2. Set tier based on usage. |\n")
+            md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | **{x['recommended_tier']}** | Plan to migrate to GPv2. Set tier to {x['recommended_tier']}. |\n")
     else:
         md_content.append("No storage accounts require manual upgrade! All accounts are compliant.\n")
     md_content.append("\n")
@@ -314,24 +342,19 @@ def write_outputs(inventory):
     
     # Section 3: All Details
     md_content.append("## Detailed Inventory Table\n\n")
-    md_content.append("| Subscription | Resource Group | Storage Account | Location | Kind | SKU | Tier | HNS | Public Net | Migration? | Size (GB) | 30d Txn | Ingress (GB) | Egress (GB) |\n")
-    md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+    md_content.append("| Subscription | Resource Group | Storage Account | Location | Kind | SKU | Tier | Recommended Tier | HNS | Public Net | Migration? | Size (GB) | 30d Txn | Ingress (GB) | Egress (GB) |\n")
+    md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
     for x in inventory:
         hns = "Yes" if x["hns_enabled"] == "Yes" else "No"
-        md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['location']} | {x['kind']} | {x['sku']} | {x['access_tier']} | {hns} | {x['public_network']} | {x['migration_needed']} | {x['capacity_gb']} | {x['transactions']} | {x['ingress_gb']} | {x['egress_gb']} |\n")
+        md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['location']} | {x['kind']} | {x['sku']} | {x['access_tier']} | {x['recommended_tier']} | {hns} | {x['public_network']} | {x['migration_needed']} | {x['capacity_gb']} | {x['transactions']} | {x['ingress_gb']} | {x['egress_gb']} |\n")
 
     full_md_text = "".join(md_content)
     try:
-        with open(MD_FILE, "w", encoding="utf-8") as f:
+        with open(md_file, "w", encoding="utf-8") as f:
             f.write(full_md_text)
-        print(f"Markdown Inventory report saved to {MD_FILE}")
-    except PermissionError:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fallback_md = f"storage_inventory_{timestamp}.md"
-        print(f"[Warning] Permission denied writing to {MD_FILE} (it may be open in another editor).")
-        print(f"Saving Markdown report to fallback file: {fallback_md}")
-        with open(fallback_md, "w", encoding="utf-8") as f:
-            f.write(full_md_text)
+        print(f"Markdown Inventory report saved to {md_file}")
+    except PermissionError as e:
+        print(f"[Error] Permission denied writing to {md_file}: {e}")
 
 if __name__ == "__main__":
     inventory_data = scan_storage_accounts()
