@@ -41,8 +41,16 @@ def get_credential():
         print(f"\nDefaultAzureCredential failed to authenticate: {e}", flush=True)
         print("Attempting Device Code login fallback...", flush=True)
         try:
+            def callback(verification_uri, user_code, expires_on):
+                print(f"\n========================================================", flush=True)
+                print(f"To sign in, use a web browser to open the page:", flush=True)
+                print(f"  {verification_uri}", flush=True)
+                print(f"And enter the code to authenticate:", flush=True)
+                print(f"  {user_code}", flush=True)
+                print(f"========================================================\n", flush=True)
+
             # DeviceCodeCredential prompts on stdout/stderr, which will show up in our logs
-            credential = DeviceCodeCredential()
+            credential = DeviceCodeCredential(prompt_callback=callback)
             # Test if credential can fetch a token (triggers the console prompt)
             credential.get_token("https://management.azure.com/.default")
             print("Successfully authenticated via Device Code.", flush=True)
@@ -318,10 +326,10 @@ def write_outputs(inventory):
     
     manual_migration_list = [x for x in inventory if x["migration_needed"] == "Yes"]
     if manual_migration_list:
-        md_content.append("| Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended GPv2 Tier | Recommended Action |\n")
-        md_content.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        md_content.append("| 核可標記 | Subscription | Resource Group | Storage Account | Kind | SKU | Capacity (GB) | 30d Transactions | Access Tier (Current) | Recommended GPv2 Tier | Recommended Action |\n")
+        md_content.append("| :---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for x in manual_migration_list:
-            md_content.append(f"| {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | **{x['recommended_tier']}** | Plan to migrate to GPv2. Set tier to {x['recommended_tier']}. |\n")
+            md_content.append(f"| [ ] | {x['subscription_name']} | {x['resource_group']} | `{x['account_name']}` | {x['kind']} | {x['sku']} | {x['capacity_gb']} | {x['transactions']} | {x['access_tier']} | **{x['recommended_tier']}** | Plan to migrate to GPv2. Set tier to {x['recommended_tier']}. |\n")
     else:
         md_content.append("No storage accounts require manual upgrade! All accounts are compliant.\n")
     md_content.append("\n")
@@ -355,6 +363,16 @@ def write_outputs(inventory):
         print(f"Markdown Inventory report saved to {md_file}")
     except PermissionError as e:
         print(f"[Error] Permission denied writing to {md_file}: {e}")
+
+    # Copy latest reports to base filenames
+    import shutil
+    try:
+        shutil.copy2(csv_file, CSV_FILE)
+        print(f"Copied latest CSV to {CSV_FILE}")
+        shutil.copy2(md_file, MD_FILE)
+        print(f"Copied latest Markdown to {MD_FILE}")
+    except Exception as e:
+        print(f"[Warning] Failed to update main files {CSV_FILE} or {MD_FILE}: {e}")
 
 if __name__ == "__main__":
     inventory_data = scan_storage_accounts()
